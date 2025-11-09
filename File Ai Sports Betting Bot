@@ -1,0 +1,129 @@
+# ===============================
+# AI Sports Betting Bot - All-in-One
+# ===============================
+import requests
+import pandas as pd
+import numpy as np
+import streamlit as st
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from streamlit_autorefresh import st_autorefresh
+
+# ---------------- CONFIG ----------------
+API_KEY = "574144be4b38d4f1f4bd24177a2f6114"  # Your API key hardcoded
+SPORTS = ["basketball_nba","football_nfl","basketball_ncaab","football_ncaaf","baseball_mlb"]
+TOP_BETS_COUNT = 5
+STAKE = 1  # For EV calculations
+
+# Auto-refresh every 60 seconds
+st_autorefresh(interval=60000, key="refresh")
+
+# ---------------- FETCH ODDS ----------------
+def fetch_odds(sport):
+    url = f"https://api.the-odds-api.com/v4/sports/{sport}/odds/"
+    params = {"apiKey": API_KEY,"regions":"us","markets":"h2h,spreads,totals","oddsFormat":"decimal"}
+    response = requests.get(url, params=params)
+    if response.status_code != 200:
+        st.error(f"Error fetching odds: {response.status_code}")
+        return []
+    return response.json()
+
+# ---------------- PREPROCESS & FEATURES ----------------
+def prepare_data(odds_data):
+    rows = []
+    for game in odds_data:
+        if 'bookmakers' not in game or len(game['bookmakers'])==0:
+            continue
+        for bookmaker in game['bookmakers']:
+            for market in bookmaker['markets']:
+                if market['key'] in ['h2h','spreads','totals']:
+                    row = {'home_team':game['home_team'],'away_team':game['away_team'],'market':market['key']}
+                    for outcome in market['outcomes']:
+                        row[outcome['name']] = outcome.get('price', np.nan)
+                    rows.append(row)
+    df = pd.DataFrame(rows).dropna()
+    return df
+
+def feature_engineering(df):
+    feature_cols = [c for c in df.columns if c not in ['home_team','away_team','market']]
+    if not feature_cols or df.empty:
+        return df, []
+    scaler = StandardScaler()
+    df[feature_cols] = scaler.fit_transform(df[feature_cols])
+    return df, feature_cols
+
+# ---------------- MODEL TRAINING ----------------
+def train_ensemble(df, feature_cols):
+    X = df[feature_cols]
+    y = (df[feature_cols[0]] < df[feature_cols[1]]).astype(int)  # mock target
+    X_train,X_test,y_train,y_test = train_test_split(X,y,test_size=0.2,random_state=42)
+    rf = RandomForestClassifier(n_estimators=100, random_state=42)
+    xgb = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
+    lr = LogisticRegression()
+    rf.fit(X_train,y_train)
+    xgb.fit(X_train,y_train)
+    lr.fit(X_train,y_train)
+    return rf,xgb,lr
+
+def ensemble_predict(models,X):
+    rf,xgb,lr = models
+    probs = (rf.predict_proba(X)[:,1] + xgb.predict_proba(X)[:,1] + lr.predict_proba(X)[:,1])/3
+    return probs
+
+# ---------------- EXPECTED VALUE ----------------
+def calculate_ev(prob_win, odds, stake=STAKE):
+    payout = (odds-1)*stake
+    ev = (prob_win*payout) - ((1-prob_win)*stake)
+    return ev
+
+# ---------------- STREAMLIT DASHBOARD ----------------
+def main():
+    st.title("AI Sports Betting Bot - Positive EV Straight Bets")
+    sport_choice = st.selectbox("Select Sport", SPORTS)
+    
+    st.write(f"Fetching odds for {sport_choice}...")
+    odds_data = fetch_odds(sport_choice)
+    if not odds_data: return
+    
+    df = prepare_data(odds_data)
+    if df.empty: st.error("No odds data available."); return
+    
+    df, feature_cols = feature_engineering(df)
+    if not feature_cols: st.error("No features available for training."); return
+    
+    st.write("Training ensemble AI model...")
+    models = train_ensemble(df, feature_cols)
+    
+    st.write("Predicting probabilities...")
+    df['pred_win_prob'] = ensemble_predict(models, df[feature_cols])
+    
+    ev_list = []
+    for idx,row in df.iterrows():
+        ev_outcomes = {}
+        for col in feature_cols:
+            ev_outcomes[col] = calculate_ev(row['pred_win_prob'], row[col], STAKE)
+        ev_list.append(ev_outcomes)
+    ev_df = pd.DataFrame(ev_list)
+    df = pd.concat([df, ev_df.add_prefix('EV_')], axis=1)
+    
+    positive_ev_cols = [c for c in df.columns if c.startswith('EV_')]
+    df['max_EV'] = df[positive_ev_cols].max(axis=1)
+    df['best_bet'] = df[positive_ev_cols].idxmax(axis=1).str.replace('EV_','')
+    
+    positive_ev_bets = df[df['max_EV']>0].copy()
+    top_bets = positive_ev_bets.nlargest(TOP_BETS_COUNT,'max_EV')
+    
+    st.subheader("Top 5 Most Profitable Bets (Positive EV)")
+    st.dataframe(top_bets[['home_team','away_team','market','best_bet','max_EV','pred_win_prob']+feature_cols])
+    
+    st.subheader("All Positive EV Bets")
+    st.dataframe(positive_ev_bets[['home_team','away_team','market','best_bet','max_EV','pred_win_prob']+feature_cols])
+    
+    print("Top 5 EV Bets:")
+    print(top_bets[['home_team','away_team','market','best_bet','max_EV','pred_win_prob']+feature_cols])
+
+if __name__=="__main__":
+    main()
